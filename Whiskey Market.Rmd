@@ -1,0 +1,347 @@
+---
+title: "Whiskey Market Research"
+author: "Bryan Berger"
+date: 
+output:
+  html_document:
+    theme: paper
+    code_folding: hide
+---
+<style type="text/css">
+   .main-container {max-width: 60%;}
+   .row {display: flex;}
+   .column {flex: 50%;}
+</style>
+
+# Overview
+
+This analysis is for a hypothetical situation where a company needs to do market research for to see how their Whiskey portfolio will fare in a new market. The company, Maidenpool Distilling, is looking to enter the the Iowa market. They want to find what are the best selling whiskies in that market are to decide how to market their portfolio and forecast which of their products will be successful. 
+
+# Finding Data
+
+Iowa is a unique market as it is a control state, meaning that the government distributes all liquor. They record all transactions in the state and make them publicly accessible. I found the data for this project in the public data sets of BigQuery. The original data set has over 26 million observations and includes all sales since 2012. I decided to refine this to focus on whiskey bottles sold.  
+
+
+```{r SQL data, eval=FALSE}
+# finding all whiskey and whisky categories 
+SELECT DISTINCT 
+  category_name
+FROM `bigquery-public-data.iowa_liquor_sales.sales` 
+WHERE category_name LIKE "%WHISK%"
+
+# exploring what time frame the data covers 
+SELECT EXTRACT(year from date) as year
+FROM `bigquery-public-data.iowa_liquor_sales.sales` 
+group by year
+ORDER BY year
+
+# extracting the relevant data 
+SELECT 
+  date,
+  category,
+  category_name,
+  vendor_name,
+  vendor_number,
+  item_description,
+  bottle_volume_ml,
+  state_bottle_cost,
+  state_bottle_retail,
+  bottles_sold
+FROM `bigquery-public-data.iowa_liquor_sales.sales` 
+WHERE category_name LIKE "%WHISK%" 
+```
+
+# Importing Data into R
+
+Once getting the data I decided to use R to complete the analysis adding relevant libraries. 
+
+```{r data environment}
+#load libraries
+
+library(tidyverse) #data analysis
+library(lubridate) #date manipulation
+library(scales) #graphing manipulation
+library(kableExtra) #table visuals
+
+#import data and separate date into columns
+sales <- read_csv("iowa_sales.csv") %>%
+  mutate(year = year(date),
+         month = month.name[month(date)],
+         day = day(date)
+         )
+```
+
+# Data Cleaning 
+
+I decided to refine the data further by only focusing on regular sized bottles a customer would purchase, extra columns were removed as they would not be used in further analysis, and only observations within the last 5 years would be included to remain contemporary.
+
+```{r recent}
+
+sales_recent <- sales %>%
+  select(-vendor_number,#remove columns no longer needed
+         -category) %>%
+  filter(between(year, 2018, 2022), #only want complete years, last 5
+         between(bottle_volume_ml, 750, 1750)# only care about regular size bottles
+         )
+
+#view stats on the data to see what steps are next
+
+skimr::skim_without_charts(sales_recent)
+```
+
+With the remaining data, I decided to standardize the vendor names so that they will easily group together. I then added calculations for total volume and profits for each transaction as well as what the state markup was. The missing observations were removed. Since there were 2 out of 2.8 million there would be little to no impact on the results. 
+
+```{r cleaning}
+
+#removed  na values 
+filtered_sales <- sales_recent %>%
+  filter(!is.na(vendor_name))
+
+
+#standardizing vendor names
+sales_clean <- filtered_sales %>%
+  mutate(vendor_name = case_when(
+   vendor_name == "AMERICAN HERITAGE DISTILLERS, LLC / CENTURY FARMS DISTILLERY" ~ "AMERICAN HERITAGE DISTILLERS, LLC",
+   vendor_name == "BRECKENRIDGE DISTILLERY / DOUBLE DIAMOND DISTILLERY LLC" ~ "BRECKENRIDGE DISTILLERY",
+   vendor_name == "CH DISTILLERY / 773 LLC" ~ "CH DISTILLERY",
+   vendor_name == "CVI BRANDS / CALIFORNIA VINEYARDS INC" ~ "CVI BRANDS",
+   vendor_name == "DUNKEL CORPORATION / IOWA DISTILLING" ~ "DUNKEL CORPORATION",
+   vendor_name == "GEORGETOWN TRADING CO. LLC / JAMES PEPPER DISTILLING CO." ~ "GEORGETOWN TRADING CO. LLC",
+   vendor_name == "KINGS COUNTRY DISTILLERY" ~ "KINGS COUNTY DISTILLERY",
+   vendor_name == "LEVECKE CORPORATION JJB" ~ "LEVECKE CORPORATION",
+   vendor_name == "MISSISSIPPI RIVER DISTIL" ~ "MISSISSIPPI RIVER DISTILLING COMPANY LLC",
+   vendor_name == "PATERNO IMPORTS LTD / TERLATO WINES INTERNATIONAL" ~ "PATERNO IMPORTS LTD",
+   vendor_name == "PRESTIGE WINE & SPIRITS GROUP / UNITED STATES DISTILLED PRODUCTS CO" ~ "PRESTIGE WINE & SPIRITS GROUP",
+   vendor_name == "SAZERAC NORTH AMERICA" ~ "SAZERAC COMPANY  INC",
+   vendor_name == "STOLLER WAREHOUSE" ~ "STOLLER IMPORTS INC",
+   vendor_name == "STOLLER IMPORTS INC / MARSALLE COMPANY" ~ "STOLLER IMPORTS INC",
+   vendor_name == "SUTTER HOME WINERY INC / TRINCHERO FAMILY ESTATES" ~ "SUTTER HOME WINERY INC",
+   vendor_name == "TRAVERSE CITY WHISKEY CO / TCWC, LLC" ~ "TRAVERSE CITY WHISKEY CO",
+   TRUE ~ vendor_name)
+   )
+
+#additional columns for analysis 
+sales_metrics <- sales_clean %>% 
+  mutate(week_day = wday(date, label = TRUE),
+         volume_sold_l = (bottle_volume_ml * bottles_sold)/1000,
+         vendor_profit = state_bottle_cost * bottles_sold,
+         markup_percent = ((state_bottle_retail - state_bottle_cost)/state_bottle_cost)*100
+         )
+```
+
+# Market Overview
+
+I decided to start by looking at what the markup is from the State to the Customer.
+```{r markup}
+sales_metrics %>% 
+  group_by(category_name) %>%
+  ggplot(aes(category_name, markup_percent))+
+    geom_boxplot()+
+    labs(title = "State Mark-Up",
+         x = NULL,
+         y = "Percent")+
+    scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()))+
+    coord_flip()
+```
+
+This box-plot indicates that there is mostly a straight 50% markup with few rare outliers going up to 75%. Based on this, all further calculations will be based on prices for the distillery selling to the state instead of the state selling to customer. 
+
+I then decided to look into when whiskey sales occurred by day, month, and year.
+```{r sales}
+#helper function for multiple plots
+time_plot <- function(df,var){
+  df %>% 
+    group_by({{ var }}) %>% 
+    summarise(sales = sum(vendor_profit)) %>% 
+    ggplot(aes(({{ var }}), sales))+
+    geom_col()+
+    scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()))
+}
+
+# sales by day of week
+week_plot <- time_plot(sales_metrics, week_day)+
+                  labs(title = "Daily Sales",
+                       y = "Total Sales",
+                       x = "Day")
+
+#sales by month
+month_plot <- time_plot(sales_metrics, month)+
+                   scale_x_discrete(limits = month.name)+
+                   labs(title = "Monthly Sales",
+                        y = "Total Sales",
+                        x = "Month")
+
+#sales by year
+year_plot <- time_plot(sales_metrics, year)+
+                  labs(title = "Yearly Sales",
+                       y = "Total Sales",
+                       x = "Year")
+week_plot
+month_plot
+year_plot
+```
+
+The sales by weekday trend towards a normal distribution with Wednesday being the peak with significantly lower sales on Saturday and Sunday. Monthly sales start low in January but then remain pretty consistent for the rest of the months with spikes in October and December. Yearly sales show an upward trend from year to year before leveling off with the most current year.   
+
+# Sales Breakdown 
+
+Next I looked into the sales based on vendor, category, then product. These were split into two areas, total volume sold by liter and the total revenue generated.
+
+## Total Volume Sold 
+
+```{r volume functions}
+# function to ease readability and speed 
+volume_top_10 <- function(df,var){
+  df %>% 
+    group_by({{ var }}) %>% 
+    summarise(volume = sum(volume_sold_l)) %>% 
+    arrange(desc(volume)) %>% 
+    slice(1:10) # top 10 only 
+}
+
+volume_graph <- function(df,var){
+  df %>% 
+    ggplot(aes(x=fct_reorder(({{var}}), volume),volume))+
+    geom_col()+
+    labs(title = "Total Volume Sold",
+         y = "Volume (l)",
+         x = NULL)+
+    scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()))+
+    coord_flip()
+}
+
+table <- function(x){
+  kable(x)%>%
+    kable_styling(bootstrap_options = c("striped", "hover"), 
+                  full_width = F, 
+                  position = "left")
+}
+```
+
+<div class = "row">
+<div class = "column">
+```{r}
+#volume sold by vendor
+vendor_volume_table <- volume_top_10(sales_metrics, vendor_name) 
+table(vendor_volume_table)
+```
+</div>
+
+<div class = "column">
+```{r}
+volume_graph(vendor_volume_table, vendor_name)
+```
+</div>
+</div>
+
+<div class = "row">
+<div class = "column">
+```{r}
+# volume sold by category
+category_volume_table <- volume_top_10(sales_metrics, category_name)
+table(category_volume_table)
+```
+</div>
+
+<div class = "column">
+```{r}
+volume_graph(category_volume_table, category_name)
+```
+</div>
+</div>
+
+<div class = "row">
+<div class = "column">
+```{r}
+# volume sold by product
+item_volume_table <- volume_top_10(sales_metrics, item_description)
+table(item_volume_table)
+```
+</div>
+
+<div class = "column">
+```{r}
+volume_graph(item_volume_table, item_description)
+```
+</div>
+</div>
+
+
+## Total Revenue
+
+```{r profit}
+# top sales by profit
+income_top_10 <- function(df,var){
+  df %>% 
+    group_by({{ var }}) %>% 
+    summarise(sales = sum(vendor_profit)) %>% 
+    arrange(desc(sales)) %>% 
+    slice(1:10) 
+}
+
+sales_graph <- function(df,var){
+  df %>% 
+    ggplot(aes(x=fct_reorder(({{var}}), sales),sales))+
+    geom_col()+
+    labs(title = "Total Sales",
+         y = "Sales ($)",
+         x = NULL)+
+    scale_y_continuous(labels = label_number(scale_cut = cut_short_scale()))+
+    coord_flip()
+}
+```
+
+<div class = "row">
+<div class = "column">
+```{r}
+category_sales_table <- income_top_10(sales_metrics, category_name)
+table(category_sales_table)
+```
+</div>
+
+<div class = "column">
+```{r}
+sales_graph(category_sales_table, category_name)
+```
+</div>
+</div>
+
+<div class = "row">
+<div class = "column">
+```{r}
+vendor_sales_table <- income_top_10(sales_metrics, vendor_name) 
+table(vendor_sales_table)
+```
+</div>
+
+<div class = "column">
+```{r}
+sales_graph(vendor_sales_table, vendor_name)
+```
+</div>
+</div>
+
+<div class = "row">
+<div class = "column">
+```{r}
+item_sales_table <- income_top_10(sales_metrics, item_description)
+table(item_sales_table)
+```
+</div>
+
+<div class = "column">
+```{r}
+sales_graph(item_sales_table, item_description)
+```
+</div>
+</div>
+
+# Important Insights 
+
+* Sales are increasing year over year and will peak in Autumn
+* Canadian whiskey was the highest in both sales and volume
+  + 5 of the top 10 products by Volume
+  + 4 of the top 10 products by sales
+* Black Velvet has significantly more sales by volume but a smaller margin for sales
+  + Crown Royal sells less by volume but because it is double the price of Black Velvet closes the gap on revenue 
+* Diverse portfolios with different price points out perform smaller portfolios that sell more volume such as Heaven Hill
